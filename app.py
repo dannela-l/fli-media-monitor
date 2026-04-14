@@ -14,7 +14,6 @@ from slack_sdk import WebClient
 
 load_dotenv()
 
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_NAME = os.getenv("SLACK_CHANNEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -26,9 +25,8 @@ LOCAL_TIMEZONE = "America/Los_Angeles"
 STATE_FILE = "seen_articles.json"
 STATUS_FILE = "run_status.json"
 
-# RSS-first settings
-USE_NEWSAPI = False
-MAX_ARTICLE_AGE_HOURS = 24
+DEFAULT_MAX_AGE = 6
+FRESHNESS_OPTIONS = [1, 3, 6, 12, 24]
 
 app = Flask(__name__)
 
@@ -97,8 +95,22 @@ RELEVANCE_TERMS = {
     "automation",
 }
 
-# Keep feeds that are already working in your setup.
-# You can add more later if you find reliable public RSS endpoints.
+STRONG_AI_TERMS = {
+    "ai",
+    "artificial intelligence",
+    "generative ai",
+    "foundation model",
+    "frontier model",
+    "large language model",
+    "llm",
+    "openai",
+    "anthropic",
+    "google deepmind",
+    "frontier ai",
+    "agi",
+    "asi",
+}
+
 RSS_FEEDS = {
     "Reuters": "https://www.reutersagency.com/feed/?best-topics=artificial-intelligence&post_type=best",
     "POLITICO": "https://www.politico.com/rss/politicopicks.xml",
@@ -150,6 +162,16 @@ PAGE_TEMPLATE = """
       line-height: 1.7;
       font-size: 16px;
     }
+    label {
+      font-weight: 600;
+    }
+    select {
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      font-size: 15px;
+      background: white;
+    }
     .btn {
       display: inline-block;
       background: #0f172a;
@@ -198,12 +220,23 @@ PAGE_TEMPLATE = """
       <strong>Topics:</strong> AI safety, AGI/ASI risk, regulation, governance, labor displacement, autonomous weapons<br>
       <strong>Slack destination:</strong> {{ channel }}<br>
       <strong>Today:</strong> {{ today }}<br>
-      <strong>Freshness window:</strong> last {{ max_age }} hours<br>
+      <strong>Freshness window:</strong> last {{ selected_hours }} hour{{ 's' if selected_hours > 1 else '' }}<br>
       <strong>Last run:</strong> {{ last_run }}<br>
       <strong>Last result:</strong> {{ last_result }}
     </div>
 
     <form method="post" action="/run">
+      <label for="hours">Freshness window</label><br><br>
+
+      <select name="hours" id="hours">
+        {% for h in options %}
+          <option value="{{ h }}" {% if h == selected_hours %}selected{% endif %}>
+            Past {{ h }} hour{{ 's' if h > 1 else '' }}
+          </option>
+        {% endfor %}
+      </select>
+
+      <br><br>
       <button class="btn" type="submit">Run clips now</button>
     </form>
 
@@ -220,36 +253,35 @@ PAGE_TEMPLATE = """
 """
 
 
-def load_seen_articles():
-    if not os.path.exists(STATE_FILE):
+def load_json_file(path):
+    if not os.path.exists(path):
         return {}
-
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
+
+
+def save_json_file(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_seen_articles():
+    return load_json_file(STATE_FILE)
 
 
 def save_seen_articles(data):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    save_json_file(STATE_FILE, data)
 
 
 def load_run_status():
-    if not os.path.exists(STATUS_FILE):
-        return {}
-
-    try:
-        with open(STATUS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return load_json_file(STATUS_FILE)
 
 
 def save_run_status(data):
-    with open(STATUS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    save_json_file(STATUS_FILE, data)
 
 
 def get_today_key():
@@ -262,10 +294,6 @@ def get_now_pt_string():
 
 
 def parse_article_datetime(date_string):
-    """
-    Parse either ISO timestamps (NewsAPI) or RSS-style published dates.
-    Return a timezone-aware datetime when possible.
-    """
     if not date_string:
         return None
 
@@ -283,7 +311,7 @@ def parse_article_datetime(date_string):
         return None
 
 
-def is_fresh_enough(date_string, hours=24):
+def is_fresh_enough(date_string, hours):
     article_dt = parse_article_datetime(date_string)
     if not article_dt:
         return False
@@ -317,6 +345,11 @@ def contains_exact_phrase(text, phrase):
 
 
 def classify_article(headline, summary):
+    """
+    Strict FLI detection:
+    - exact phrase match for FLI terms and spokesperson names
+    - broader keyword match for relevant coverage
+    """
     text = f"{headline} {summary}".lower()
 
     for term in FLI_TERMS:
@@ -332,6 +365,11 @@ def classify_article(headline, summary):
             return "Relevant Coverage"
 
     return None
+
+
+def has_strong_ai_signal(text):
+    lowered = text.lower()
+    return any(term in lowered for term in STRONG_AI_TERMS)
 
 
 def generate_why_it_matters(category, text):
@@ -457,8 +495,8 @@ WHY:
         return trim_to_n_sentences(summary, 3), None
 
 
-def format_article(publication, headline, link, date, summary, why):
-    pretty_date = clean_date(date)
+def format_article(publication, headline, link, date_string, summary, why):
+    pretty_date = clean_date(date_string)
 
     return (
         f"*{publication}* | <{link}|{headline}>\n"
@@ -466,34 +504,6 @@ def format_article(publication, headline, link, date, summary, why):
         f"• *Summary:* {summary}\n\n"
         f"• *Why it matters:* {why}"
     )
-
-
-def fetch_newsapi_articles():
-    if not USE_NEWSAPI:
-        return []
-
-    if not NEWS_API_KEY:
-        print("Missing NEWS_API_KEY in environment")
-        return []
-
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "q": '("AI" AND ("regulation" OR "policy" OR "safety" OR "AGI" OR "ASI" OR "labor")) OR "Max Tegmark" OR "Future of Life Institute"',
-        "domains": "reuters.com,politico.com,nytimes.com,washingtonpost.com,bloomberg.com,ft.com,wired.com,technologyreview.com,axios.com,semafor.com,theatlantic.com,cnn.com,cnbc.com,bbc.com",
-        "language": "en",
-        "sortBy": "publishedAt",
-        "pageSize": 20,
-        "apiKey": NEWS_API_KEY,
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("articles", [])
-    except Exception as e:
-        print(f"NewsAPI error: {e}")
-        return []
 
 
 def fetch_rss_articles():
@@ -628,7 +638,7 @@ def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant)
     )
 
 
-def run_clipbook():
+def run_clipbook(max_hours):
     seen_data = load_seen_articles()
     today_key = get_today_key()
 
@@ -637,11 +647,7 @@ def run_clipbook():
 
     seen_today = set(seen_data[today_key])
 
-    newsapi_articles = fetch_newsapi_articles()
-    rss_articles = fetch_rss_articles()
-
-    # RSS first / primary
-    articles = rss_articles + newsapi_articles
+    articles = fetch_rss_articles()
 
     formatted_fli = []
     formatted_relevant = []
@@ -658,8 +664,7 @@ def run_clipbook():
         link = article.get("url", "") or ""
         date_string = article.get("publishedAt", "") or ""
 
-        # Only keep fresh articles
-        if not is_fresh_enough(date_string, MAX_ARTICLE_AGE_HOURS):
+        if not is_fresh_enough(date_string, max_hours):
             continue
 
         clean_link = normalize_url(link)
@@ -681,10 +686,8 @@ def run_clipbook():
         if not category:
             continue
 
-        if category == "Relevant Coverage":
-            lowered_combined = combined_text.lower()
-            if "ai" not in lowered_combined and "artificial intelligence" not in lowered_combined:
-                continue
+        if category == "Relevant Coverage" and not has_strong_ai_signal(combined_text):
+            continue
 
         summary, ai_why = enhance_article_with_ai(
             headline=headline,
@@ -699,7 +702,7 @@ def run_clipbook():
             publication=publication,
             headline=headline,
             link=link,
-            date=date_string,
+            date_string=date_string,
             summary=summary,
             why=why,
         )
@@ -717,7 +720,7 @@ def run_clipbook():
     if not formatted_fli and not formatted_relevant:
         result = {
             "ok": True,
-            "message": f"No new matching clips found in the last {MAX_ARTICLE_AGE_HOURS} hours.",
+            "message": f"No new matching clips found in the last {max_hours} hours.",
         }
         save_run_status({
             "last_run": get_now_pt_string(),
@@ -736,7 +739,8 @@ def run_clipbook():
         "ok": True,
         "message": (
             f"Posted {total} new clips to Slack "
-            f"({len(formatted_fli)} FLI / {len(formatted_relevant)} relevant coverage)."
+            f"({len(formatted_fli)} FLI / {len(formatted_relevant)} relevant coverage) "
+            f"— last {max_hours}h window."
         ),
     }
 
@@ -751,26 +755,38 @@ def run_clipbook():
 @app.route("/", methods=["GET"])
 def home():
     status = load_run_status()
+    selected_hours = int(request.args.get("hours", DEFAULT_MAX_AGE))
 
     return render_template_string(
         PAGE_TEMPLATE,
         channel=SLACK_CHANNEL_NAME,
         today=get_today_key(),
-        max_age=MAX_ARTICLE_AGE_HOURS,
         last_run=status.get("last_run", "Not run yet"),
         last_result=status.get("last_result", "No runs yet"),
         message=request.args.get("message"),
         ok=request.args.get("ok") == "1",
+        options=FRESHNESS_OPTIONS,
+        selected_hours=selected_hours,
     )
 
 
 @app.route("/run", methods=["POST", "GET"])
 def run_now():
     try:
-        result = run_clipbook()
+        if request.method == "POST":
+            hours = int(request.form.get("hours", DEFAULT_MAX_AGE))
+        else:
+            hours = int(request.args.get("hours", DEFAULT_MAX_AGE))
+
+        result = run_clipbook(hours)
 
         if request.method == "POST":
-            return redirect(url_for("home", message=result["message"], ok="1"))
+            return redirect(url_for(
+                "home",
+                message=result["message"],
+                ok="1",
+                hours=hours,
+            ))
 
         return result["message"], 200
 
