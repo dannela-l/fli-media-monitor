@@ -23,6 +23,7 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 LOCAL_TIMEZONE = "America/Los_Angeles"
 STATE_FILE = "seen_articles.json"
+STATUS_FILE = "run_status.json"
 
 app = Flask(__name__)
 
@@ -127,21 +128,24 @@ PAGE_TEMPLATE = """
     h1 {
       margin-top: 0;
       font-size: 32px;
+      color: #1e293b;
     }
     .sub {
       color: #6b7280;
       margin-bottom: 24px;
+      font-size: 16px;
     }
     .status {
       background: #f3f4f6;
       border-radius: 12px;
       padding: 16px;
       margin-bottom: 20px;
-      line-height: 1.5;
+      line-height: 1.7;
+      font-size: 16px;
     }
     .btn {
       display: inline-block;
-      background: #111827;
+      background: #0f172a;
       color: white;
       text-decoration: none;
       padding: 14px 20px;
@@ -152,7 +156,7 @@ PAGE_TEMPLATE = """
       font-size: 16px;
     }
     .btn:hover {
-      background: #000;
+      background: #020617;
     }
     .note {
       margin-top: 20px;
@@ -165,6 +169,7 @@ PAGE_TEMPLATE = """
       color: #065f46;
       border-radius: 12px;
       padding: 14px 16px;
+      font-size: 15px;
     }
     .error {
       margin-top: 20px;
@@ -172,6 +177,7 @@ PAGE_TEMPLATE = """
       color: #991b1b;
       border-radius: 12px;
       padding: 14px 16px;
+      font-size: 15px;
     }
   </style>
 </head>
@@ -184,7 +190,9 @@ PAGE_TEMPLATE = """
       <strong>Client:</strong> Future of Life Institute<br>
       <strong>Topics:</strong> AI safety, AGI/ASI risk, regulation, governance, labor displacement, autonomous weapons<br>
       <strong>Slack destination:</strong> {{ channel }}<br>
-      <strong>Today:</strong> {{ today }}
+      <strong>Today:</strong> {{ today }}<br>
+      <strong>Last run:</strong> {{ last_run }}<br>
+      <strong>Last result:</strong> {{ last_result }}
     </div>
 
     <form method="post" action="/run">
@@ -220,8 +228,29 @@ def save_seen_articles(data):
         json.dump(data, f, indent=2)
 
 
+def load_run_status():
+    if not os.path.exists(STATUS_FILE):
+        return {}
+
+    try:
+        with open(STATUS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_run_status(data):
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def get_today_key():
     return date.today().isoformat()
+
+
+def get_now_pt_string():
+    now = datetime.now(ZoneInfo(LOCAL_TIMEZONE))
+    return now.strftime("%b %d, %Y at %I:%M %p PT")
 
 
 def clean_date(date_string):
@@ -240,7 +269,7 @@ def normalize_url(url):
 
 
 def contains_exact_phrase(text, phrase):
-    pattern = r"\\b" + re.escape(phrase.lower()) + r"\\b"
+    pattern = r"\b" + re.escape(phrase.lower()) + r"\b"
     return re.search(pattern, text.lower()) is not None
 
 
@@ -306,7 +335,7 @@ def trim_to_n_sentences(text, max_sentences):
     if not text:
         return text
 
-    sentences = re.split(r'(?<=[.!?])\\s+', text)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
     trimmed = " ".join(sentences[:max_sentences]).strip()
 
     if trimmed and trimmed[-1] not in ".!?":
@@ -389,16 +418,16 @@ def format_article(publication, headline, link, date, summary, why):
     pretty_date = clean_date(date)
 
     return (
-        f"*{publication}* | <{link}|{headline}>\\n"
-        f"🕒 {pretty_date}\\n\\n"
-        f"• *Summary:* {summary}\\n\\n"
+        f"*{publication}* | <{link}|{headline}>\n"
+        f"🕒 {pretty_date}\n\n"
+        f"• *Summary:* {summary}\n\n"
         f"• *Why it matters:* {why}"
     )
 
 
 def fetch_newsapi_articles():
     if not NEWS_API_KEY:
-        print("Missing NEWS_API_KEY in .env")
+        print("Missing NEWS_API_KEY in environment")
         return []
 
     url = "https://newsapi.org/v2/everything"
@@ -486,21 +515,21 @@ def build_narrative_summary(formatted_fli, article_texts):
             "• Today’s coverage broadly aligns with FLI’s focus on AI safety, oversight, and the societal consequences of advanced AI systems."
         )
 
-    return "🔑 *KEY NARRATIVES TODAY*\\n\\n" + "\\n".join(lines[:4])
+    return "🔑 *KEY NARRATIVES TODAY*\n\n" + "\n".join(lines[:4])
 
 
 def build_section_message(header, articles, empty_text):
     if not articles:
-        return f"{header}\\n\\n_{empty_text}_"
+        return f"{header}\n\n_{empty_text}_"
 
-    return f"{header}\\n\\n" + "\\n\\n──────────\\n\\n".join(articles)
+    return f"{header}\n\n" + "\n\n──────────\n\n".join(articles)
 
 
 def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant):
     main_text = (
-        "📰 *FLI DAILY CLIPBOOK*\\n"
-        "_What’s driving coverage today:_\\n\\n"
-        f"{narrative_summary}\\n\\n"
+        "📰 *FLI DAILY CLIPBOOK*\n"
+        "_What’s driving coverage today:_\n\n"
+        f"{narrative_summary}\n\n"
         "_See thread for today’s clips._"
     )
 
@@ -635,7 +664,15 @@ def run_clipbook():
     formatted_relevant = formatted_relevant[:4]
 
     if not formatted_fli and not formatted_relevant:
-        return {"ok": True, "message": "No new matching clips found today."}
+        result = {
+            "ok": True,
+            "message": "No new matching clips found today."
+        }
+        save_run_status({
+            "last_run": get_now_pt_string(),
+            "last_result": result["message"]
+        })
+        return result
 
     narrative_summary = build_narrative_summary(formatted_fli, article_texts)
     post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant)
@@ -644,7 +681,7 @@ def run_clipbook():
     save_seen_articles(seen_data)
 
     total = len(formatted_fli) + len(formatted_relevant)
-    return {
+    result = {
         "ok": True,
         "message": (
             f"Posted {total} new clips to Slack "
@@ -652,13 +689,24 @@ def run_clipbook():
         ),
     }
 
+    save_run_status({
+        "last_run": get_now_pt_string(),
+        "last_result": result["message"]
+    })
+
+    return result
+
 
 @app.route("/", methods=["GET"])
 def home():
+    status = load_run_status()
+
     return render_template_string(
         PAGE_TEMPLATE,
         channel=SLACK_CHANNEL_NAME,
         today=get_today_key(),
+        last_run=status.get("last_run", "Not run yet"),
+        last_result=status.get("last_result", "No runs yet"),
         message=request.args.get("message"),
         ok=request.args.get("ok") == "1",
     )
@@ -670,7 +718,12 @@ def run_now():
         result = run_clipbook()
         return redirect(url_for("home", message=result["message"], ok="1"))
     except Exception as e:
-        return redirect(url_for("home", message=f"Run failed: {e}", ok="0"))
+        error_message = f"Run failed: {e}"
+        save_run_status({
+            "last_run": get_now_pt_string(),
+            "last_result": error_message
+        })
+        return redirect(url_for("home", message=error_message, ok="0"))
 
 
 if __name__ == "__main__":
