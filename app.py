@@ -1,7 +1,8 @@
 import os
 import re
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -24,6 +25,10 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 LOCAL_TIMEZONE = "America/Los_Angeles"
 STATE_FILE = "seen_articles.json"
 STATUS_FILE = "run_status.json"
+
+# RSS-first settings
+USE_NEWSAPI = False
+MAX_ARTICLE_AGE_HOURS = 24
 
 app = Flask(__name__)
 
@@ -92,6 +97,8 @@ RELEVANCE_TERMS = {
     "automation",
 }
 
+# Keep feeds that are already working in your setup.
+# You can add more later if you find reliable public RSS endpoints.
 RSS_FEEDS = {
     "Reuters": "https://www.reutersagency.com/feed/?best-topics=artificial-intelligence&post_type=best",
     "POLITICO": "https://www.politico.com/rss/politicopicks.xml",
@@ -191,6 +198,7 @@ PAGE_TEMPLATE = """
       <strong>Topics:</strong> AI safety, AGI/ASI risk, regulation, governance, labor displacement, autonomous weapons<br>
       <strong>Slack destination:</strong> {{ channel }}<br>
       <strong>Today:</strong> {{ today }}<br>
+      <strong>Freshness window:</strong> last {{ max_age }} hours<br>
       <strong>Last run:</strong> {{ last_run }}<br>
       <strong>Last result:</strong> {{ last_result }}
     </div>
@@ -253,9 +261,44 @@ def get_now_pt_string():
     return now.strftime("%b %d, %Y at %I:%M %p PT")
 
 
-def clean_date(date_string):
+def parse_article_datetime(date_string):
+    """
+    Parse either ISO timestamps (NewsAPI) or RSS-style published dates.
+    Return a timezone-aware datetime when possible.
+    """
+    if not date_string:
+        return None
+
     try:
-        dt = datetime.fromisoformat(date_string.replace("Z", "+00:00"))
+        return datetime.fromisoformat(date_string.replace("Z", "+00:00"))
+    except Exception:
+        pass
+
+    try:
+        dt = parsedate_to_datetime(date_string)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def is_fresh_enough(date_string, hours=24):
+    article_dt = parse_article_datetime(date_string)
+    if not article_dt:
+        return False
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=hours)
+    return article_dt >= cutoff
+
+
+def clean_date(date_string):
+    dt = parse_article_datetime(date_string)
+    if not dt:
+        return date_string
+
+    try:
         local_dt = dt.astimezone(ZoneInfo(LOCAL_TIMEZONE))
         return local_dt.strftime("%b %d, %Y at %I:%M %p PT")
     except Exception:
@@ -426,6 +469,9 @@ def format_article(publication, headline, link, date, summary, why):
 
 
 def fetch_newsapi_articles():
+    if not USE_NEWSAPI:
+        return []
+
     if not NEWS_API_KEY:
         print("Missing NEWS_API_KEY in environment")
         return []
@@ -457,11 +503,11 @@ def fetch_rss_articles():
         try:
             feed = feedparser.parse(feed_url)
 
-            for entry in feed.entries[:10]:
+            for entry in feed.entries[:15]:
                 title = entry.get("title", "")
                 link = entry.get("link", "")
                 summary = entry.get("summary", "") or entry.get("description", "")
-                published = entry.get("published", "") or entry.get("updated", "") or "Unknown date"
+                published = entry.get("published", "") or entry.get("updated", "") or ""
 
                 rss_articles.append({
                     "source": {"name": source_name},
@@ -593,7 +639,9 @@ def run_clipbook():
 
     newsapi_articles = fetch_newsapi_articles()
     rss_articles = fetch_rss_articles()
-    articles = newsapi_articles + rss_articles
+
+    # RSS first / primary
+    articles = rss_articles + newsapi_articles
 
     formatted_fli = []
     formatted_relevant = []
@@ -608,7 +656,11 @@ def run_clipbook():
         headline = article.get("title", "") or ""
         raw_summary = article.get("description") or "No summary available."
         link = article.get("url", "") or ""
-        date = article.get("publishedAt", "") or ""
+        date_string = article.get("publishedAt", "") or ""
+
+        # Only keep fresh articles
+        if not is_fresh_enough(date_string, MAX_ARTICLE_AGE_HOURS):
+            continue
 
         clean_link = normalize_url(link)
         if not clean_link:
@@ -647,7 +699,7 @@ def run_clipbook():
             publication=publication,
             headline=headline,
             link=link,
-            date=date,
+            date=date_string,
             summary=summary,
             why=why,
         )
@@ -665,7 +717,7 @@ def run_clipbook():
     if not formatted_fli and not formatted_relevant:
         result = {
             "ok": True,
-            "message": "No new matching clips found today.",
+            "message": f"No new matching clips found in the last {MAX_ARTICLE_AGE_HOURS} hours.",
         }
         save_run_status({
             "last_run": get_now_pt_string(),
@@ -704,6 +756,7 @@ def home():
         PAGE_TEMPLATE,
         channel=SLACK_CHANNEL_NAME,
         today=get_today_key(),
+        max_age=MAX_ARTICLE_AGE_HOURS,
         last_run=status.get("last_run", "Not run yet"),
         last_result=status.get("last_result", "No runs yet"),
         message=request.args.get("message"),
@@ -716,20 +769,20 @@ def run_now():
     try:
         result = run_clipbook()
 
-        # If triggered by browser (button)
         if request.method == "POST":
             return redirect(url_for("home", message=result["message"], ok="1"))
 
-        # If triggered by cron job (GET)
         return result["message"], 200
 
     except Exception as e:
         error_message = f"Run failed: {e}"
-
         save_run_status({
             "last_run": get_now_pt_string(),
             "last_result": error_message,
         })
+
+        if request.method == "POST":
+            return redirect(url_for("home", message=error_message, ok="0"))
 
         return error_message, 500
 
