@@ -335,7 +335,7 @@ def trim_to_n_sentences(text, max_sentences):
     if not text:
         return text
 
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
     trimmed = " ".join(sentences[:max_sentences]).strip()
 
     if trimmed and trimmed[-1] not in ".!?":
@@ -521,7 +521,6 @@ def build_narrative_summary(formatted_fli, article_texts):
 def build_section_message(header, articles, empty_text):
     if not articles:
         return f"{header}\n\n_{empty_text}_"
-
     return f"{header}\n\n" + "\n\n──────────\n\n".join(articles)
 
 
@@ -549,13 +548,13 @@ def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant)
     fli_message = build_section_message(
         "🧠 *FUTURE OF LIFE INSTITUTE*",
         formatted_fli,
-        "No direct mentions today."
+        "No direct mentions today.",
     )
 
     relevant_message = build_section_message(
         "📌 *RELEVANT COVERAGE*",
         formatted_relevant,
-        "No relevant coverage today."
+        "No relevant coverage today.",
     )
 
     client.chat_postMessage(
@@ -666,11 +665,11 @@ def run_clipbook():
     if not formatted_fli and not formatted_relevant:
         result = {
             "ok": True,
-            "message": "No new matching clips found today."
+            "message": "No new matching clips found today.",
         }
         save_run_status({
             "last_run": get_now_pt_string(),
-            "last_result": result["message"]
+            "last_result": result["message"],
         })
         return result
 
@@ -691,7 +690,7 @@ def run_clipbook():
 
     save_run_status({
         "last_run": get_now_pt_string(),
-        "last_result": result["message"]
+        "last_result": result["message"],
     })
 
     return result
@@ -721,7 +720,7 @@ def run_now():
         error_message = f"Run failed: {e}"
         save_run_status({
             "last_run": get_now_pt_string(),
-            "last_result": error_message
+            "last_result": error_message,
         })
         return redirect(url_for("home", message=error_message, ok="0"))
 
