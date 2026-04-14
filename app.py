@@ -31,6 +31,13 @@ FRESHNESS_OPTIONS = [1, 3, 6, 12, 24, 48]
 USE_NEWSAPI = True
 MAX_AI_ARTICLES = 4
 
+# Default FLI demo configuration
+DEFAULT_CLIENT_NAME = "Future of Life Institute"
+DEFAULT_TOPICS_TEXT = (
+    "AI safety, AGI, ASI, AI regulation, AI policy, AI governance, "
+    "autonomous weapons, labor displacement, automation, existential risk"
+)
+
 app = Flask(__name__)
 
 TOP_TIER_OUTLETS = {
@@ -137,7 +144,7 @@ PAGE_TEMPLATE = """
 <html>
 <head>
   <meta charset="utf-8">
-  <title>FLI Media Monitor</title>
+  <title>{{ client_name }} Media Monitor</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body {
@@ -148,7 +155,7 @@ PAGE_TEMPLATE = """
       color: #1f2937;
     }
     .card {
-      max-width: 760px;
+      max-width: 820px;
       margin: 0 auto;
       background: white;
       border-radius: 16px;
@@ -176,12 +183,29 @@ PAGE_TEMPLATE = """
     label {
       font-weight: 600;
     }
-    select {
+    input[type="text"], select {
       padding: 10px 12px;
       border-radius: 8px;
       border: 1px solid #cbd5e1;
       font-size: 15px;
       background: white;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    textarea {
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      font-size: 15px;
+      background: white;
+      width: 100%;
+      min-height: 84px;
+      box-sizing: border-box;
+      resize: vertical;
+      font-family: inherit;
+    }
+    .field {
+      margin-bottom: 16px;
     }
     .check {
       margin-top: 14px;
@@ -230,12 +254,12 @@ PAGE_TEMPLATE = """
 </head>
 <body>
   <div class="card">
-    <h1>📰 FLI Media Monitor</h1>
-    <div class="sub">AI-powered media monitoring for Future of Life Institute</div>
+    <h1>📰 {{ client_name }} Media Monitor</h1>
+    <div class="sub">AI-powered media monitoring with configurable delivery and topics</div>
 
     <div class="status">
-      <strong>Client:</strong> Future of Life Institute<br>
-      <strong>Slack destination:</strong> {{ channel }}<br>
+      <strong>Client:</strong> {{ client_name }}<br>
+      <strong>Slack destination:</strong> {{ selected_channel }}<br>
       <strong>Today:</strong> {{ today }}<br>
       <strong>Freshness window:</strong> last {{ selected_hours }} hour{{ 's' if selected_hours > 1 else '' }}<br>
       <strong>Mode:</strong> {{ "Test mode (dedupe bypassed)" if test_mode else "Normal mode" }}<br>
@@ -245,14 +269,31 @@ PAGE_TEMPLATE = """
     </div>
 
     <form method="post" action="/run">
-      <label for="hours">Freshness window</label><br><br>
-      <select name="hours" id="hours">
-        {% for h in options %}
-          <option value="{{ h }}" {% if h == selected_hours %}selected{% endif %}>
-            Past {{ h }} hour{{ 's' if h > 1 else '' }}
-          </option>
-        {% endfor %}
-      </select>
+      <div class="field">
+        <label for="client_name">Client name</label><br><br>
+        <input type="text" id="client_name" name="client_name" value="{{ client_name }}">
+      </div>
+
+      <div class="field">
+        <label for="channel">Slack channel</label><br><br>
+        <input type="text" id="channel" name="channel" value="{{ selected_channel }}" placeholder="#client-channel">
+      </div>
+
+      <div class="field">
+        <label for="topics">Topics (comma separated)</label><br><br>
+        <textarea id="topics" name="topics" placeholder="AI safety, regulation, labor displacement">{{ topics_text }}</textarea>
+      </div>
+
+      <div class="field">
+        <label for="hours">Freshness window</label><br><br>
+        <select name="hours" id="hours">
+          {% for h in options %}
+            <option value="{{ h }}" {% if h == selected_hours %}selected{% endif %}>
+              Past {{ h }} hour{{ 's' if h > 1 else '' }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
 
       <div class="check">
         <input type="checkbox" id="test_mode" name="test_mode" value="1" {% if test_mode %}checked{% endif %}>
@@ -268,7 +309,7 @@ PAGE_TEMPLATE = """
     {% endif %}
 
     <div class="note">
-      This page triggers the clip workflow and posts the output into Slack. In normal mode, same-day duplicate clips are skipped. In test mode, clips may be reposted for preview purposes.
+      This page triggers the clip workflow and posts the output into Slack. In normal mode, same-day duplicate clips are skipped. In test mode, clips may be reposted for preview purposes. To post to a different Slack channel, the bot must already be invited there.
     </div>
   </div>
 </body>
@@ -358,21 +399,38 @@ def normalize_url(url):
     return url.split("?")[0].rstrip("/")
 
 
+def normalize_channel(channel):
+    channel = (channel or "").strip()
+    return channel or SLACK_CHANNEL_NAME
+
+
+def parse_topics(topics_text):
+    if not topics_text:
+        return []
+    return [topic.strip().lower() for topic in topics_text.split(",") if topic.strip()]
+
+
 def contains_exact_phrase(text, phrase):
     pattern = r"\b" + re.escape(phrase.lower()) + r"\b"
     return re.search(pattern, text.lower()) is not None
 
 
-def has_any_relevance_signal(text):
+def has_any_relevance_signal(text, user_topics):
     lowered = text.lower()
+
     if any(term in lowered for term in RELEVANCE_TERMS):
         return True
+
     if any(term in lowered for term in STRONG_AI_TERMS):
         return True
+
+    if any(topic in lowered for topic in user_topics):
+        return True
+
     return False
 
 
-def classify_article(headline, summary, content):
+def classify_article(headline, summary, content, user_topics):
     text = f"{headline} {summary} {content}".lower()
 
     for term in FLI_TERMS:
@@ -383,7 +441,7 @@ def classify_article(headline, summary, content):
         if contains_exact_phrase(text, person):
             return "Future of Life Institute"
 
-    if has_any_relevance_signal(text):
+    if has_any_relevance_signal(text, user_topics):
         return "Relevant Coverage"
 
     return None
@@ -421,13 +479,6 @@ CRITICAL RULES:
 - Avoid repeating the headline
 - No filler language
 - Do NOT include a separate "why it matters" section
-
-FLI context:
-- AI safety
-- AGI / ASI risk
-- Regulation and governance
-- Labor displacement
-- Autonomous weapons
 
 ARTICLE:
 Headline: {headline}
@@ -516,26 +567,26 @@ def fetch_newsapi_articles():
         return []
 
 
-def build_narrative_summary(formatted_fli, article_texts):
+def build_narrative_summary(formatted_fli, article_texts, client_name):
     text_blob = " ".join(article_texts).lower()
     lines = []
 
     if "regulation" in text_blob or "policy" in text_blob or "governance" in text_blob:
-        lines.append("• Coverage is centering on AI regulation, governance, and whether public safeguards are keeping pace.")
+        lines.append("• Coverage is centering on regulation, governance, and whether public safeguards are keeping pace.")
     if "labor" in text_blob or "worker" in text_blob or "jobs" in text_blob or "automation" in text_blob:
-        lines.append("• Labor displacement and the impact of AI on workers continue to surface as a meaningful media theme.")
+        lines.append("• Labor displacement and the impact of automation on workers continue to surface as a meaningful media theme.")
     if "autonomous weapons" in text_blob or "military" in text_blob or "defense" in text_blob:
-        lines.append("• National security and autonomous weapons risks remain part of the broader AI conversation.")
+        lines.append("• National security and autonomous weapons risks remain part of the broader conversation.")
     if "agi" in text_blob or "asi" in text_blob or "superintelligence" in text_blob:
         lines.append("• Some coverage continues to reflect concern about increasingly powerful AI systems and the risks of accelerating capability development.")
 
     if formatted_fli:
-        lines.append("• At least one story directly referenced FLI or one of its spokespeople, giving the organization a direct foothold in today’s coverage.")
+        lines.append(f"• At least one story directly referenced {client_name} or a known spokesperson, giving the client a direct foothold in today’s coverage.")
     else:
-        lines.append("• No direct FLI or spokesperson mentions appeared in this batch, but several stories still aligned with FLI’s core issue areas.")
+        lines.append("• No direct client or spokesperson mentions appeared in this batch, but several stories still aligned with the selected issue areas.")
 
     if not lines:
-        lines.append("• Today’s coverage broadly aligns with FLI’s focus on AI safety, oversight, and the societal consequences of advanced AI systems.")
+        lines.append("• Today’s coverage broadly aligns with the selected issue areas and broader media environment.")
 
     return "🔑 *KEY NARRATIVES TODAY*\n\n" + "\n".join(lines[:4])
 
@@ -546,15 +597,17 @@ def build_section_message(header, articles, empty_text):
     return f"{header}\n\n" + "\n\n──────────\n\n".join(articles)
 
 
-def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant, test_mode=False):
-    title = "FLI Daily Clipbook (Test Mode)" if test_mode else "FLI Daily Clipbook"
+def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant, channel, client_name, test_mode=False):
+    title = f"{client_name} Daily Clipbook"
+    if test_mode:
+        title += " (Test Mode)"
 
     test_note = ""
     if test_mode:
         test_note = "_Test mode is ON — same-day dedupe was bypassed for this run._\n\n"
 
     main_text = (
-        "📰 *FLI DAILY CLIPBOOK*\n"
+        f"📰 *{client_name.upper()} DAILY CLIPBOOK*\n"
         "_What’s driving coverage today:_\n\n"
         f"{narrative_summary}\n\n"
         f"{test_note}"
@@ -562,7 +615,7 @@ def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant,
     )
 
     parent = client.chat_postMessage(
-        channel=SLACK_CHANNEL_NAME,
+        channel=channel,
         text=title,
         blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": main_text[:2900]}}],
     )
@@ -570,7 +623,7 @@ def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant,
     thread_ts = parent["ts"]
 
     fli_message = build_section_message(
-        "🧠 *FUTURE OF LIFE INSTITUTE*",
+        "🧠 *DIRECT / SPOKESPERSON MENTIONS*",
         formatted_fli,
         "No direct mentions today.",
     )
@@ -582,21 +635,26 @@ def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant,
     )
 
     client.chat_postMessage(
-        channel=SLACK_CHANNEL_NAME,
+        channel=channel,
         thread_ts=thread_ts,
-        text="Future of Life Institute clips",
+        text="Direct mentions",
         blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": fli_message[:2900]}}],
     )
 
     client.chat_postMessage(
-        channel=SLACK_CHANNEL_NAME,
+        channel=channel,
         thread_ts=thread_ts,
-        text="Relevant Coverage clips",
+        text="Relevant coverage",
         blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": relevant_message[:2900]}}],
     )
 
 
-def run_clipbook(max_hours, test_mode=False):
+def run_clipbook(max_hours, test_mode=False, channel=None, topics_text=None, client_name=None):
+    channel = normalize_channel(channel)
+    topics_text = topics_text if topics_text is not None else DEFAULT_TOPICS_TEXT
+    client_name = client_name.strip() if client_name else DEFAULT_CLIENT_NAME
+    user_topics = parse_topics(topics_text)
+
     seen_data = load_seen_articles()
     today_key = get_today_key()
 
@@ -609,7 +667,7 @@ def run_clipbook(max_hours, test_mode=False):
     newsapi_articles = fetch_newsapi_articles()
     articles = rss_articles + newsapi_articles
 
-    formatted_fli = []
+    formatted_direct = []
     formatted_relevant = []
     seen_urls = set()
     article_texts = []
@@ -641,7 +699,7 @@ def run_clipbook(max_hours, test_mode=False):
 
         seen_urls.add(clean_link)
 
-        category = classify_article(headline, raw_summary, content)
+        category = classify_article(headline, raw_summary, content, user_topics)
         if not category:
             continue
 
@@ -668,17 +726,17 @@ def run_clipbook(max_hours, test_mode=False):
         )
 
         if category == "Future of Life Institute":
-            formatted_fli.append(formatted)
+            formatted_direct.append(formatted)
         else:
             formatted_relevant.append(formatted)
 
         if not test_mode:
             seen_today.add(clean_link)
 
-    formatted_fli = formatted_fli[:3]
+    formatted_direct = formatted_direct[:3]
     formatted_relevant = formatted_relevant[:3]
 
-    if not formatted_fli and not formatted_relevant:
+    if not formatted_direct and not formatted_relevant:
         result = {
             "ok": True,
             "message": (
@@ -693,19 +751,26 @@ def run_clipbook(max_hours, test_mode=False):
         })
         return result
 
-    narrative_summary = build_narrative_summary(formatted_fli, article_texts)
-    post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant, test_mode=test_mode)
+    narrative_summary = build_narrative_summary(formatted_direct, article_texts, client_name)
+    post_threaded_clipbook(
+        narrative_summary=narrative_summary,
+        formatted_fli=formatted_direct,
+        formatted_relevant=formatted_relevant,
+        channel=channel,
+        client_name=client_name,
+        test_mode=test_mode,
+    )
 
     if not test_mode:
         seen_data[today_key] = list(seen_today)
         save_seen_articles(seen_data)
 
-    total = len(formatted_fli) + len(formatted_relevant)
+    total = len(formatted_direct) + len(formatted_relevant)
     result = {
         "ok": True,
         "message": (
             f"Posted {total} clip(s) to Slack "
-            f"({len(formatted_fli)} FLI / {len(formatted_relevant)} relevant coverage) "
+            f"({len(formatted_direct)} direct / {len(formatted_relevant)} relevant) "
             f"— last {max_hours}h window"
             f"{' [TEST MODE]' if test_mode else ''}."
         ),
@@ -724,6 +789,9 @@ def home():
     status = load_run_status()
     selected_hours = int(request.args.get("hours", DEFAULT_MAX_AGE))
     test_mode = request.args.get("test_mode", "0") == "1"
+    selected_channel = request.args.get("channel", SLACK_CHANNEL_NAME)
+    topics_text = request.args.get("topics", DEFAULT_TOPICS_TEXT)
+    client_name = request.args.get("client_name", DEFAULT_CLIENT_NAME)
 
     return render_template_string(
         PAGE_TEMPLATE,
@@ -737,6 +805,9 @@ def home():
         selected_hours=selected_hours,
         test_mode=test_mode,
         use_newsapi=USE_NEWSAPI,
+        selected_channel=selected_channel,
+        topics_text=topics_text,
+        client_name=client_name,
     )
 
 
@@ -746,11 +817,23 @@ def run_now():
         if request.method == "POST":
             hours = int(request.form.get("hours", DEFAULT_MAX_AGE))
             test_mode = request.form.get("test_mode") == "1"
+            channel = request.form.get("channel", SLACK_CHANNEL_NAME)
+            topics_text = request.form.get("topics", DEFAULT_TOPICS_TEXT)
+            client_name = request.form.get("client_name", DEFAULT_CLIENT_NAME)
         else:
             hours = int(request.args.get("hours", DEFAULT_MAX_AGE))
             test_mode = request.args.get("test_mode", "0") == "1"
+            channel = request.args.get("channel", SLACK_CHANNEL_NAME)
+            topics_text = request.args.get("topics", DEFAULT_TOPICS_TEXT)
+            client_name = request.args.get("client_name", DEFAULT_CLIENT_NAME)
 
-        result = run_clipbook(hours, test_mode=test_mode)
+        result = run_clipbook(
+            max_hours=hours,
+            test_mode=test_mode,
+            channel=channel,
+            topics_text=topics_text,
+            client_name=client_name,
+        )
 
         if request.method == "POST":
             return redirect(url_for(
@@ -759,6 +842,9 @@ def run_now():
                 ok="1",
                 hours=hours,
                 test_mode="1" if test_mode else "0",
+                channel=channel,
+                topics=topics_text,
+                client_name=client_name,
             ))
 
         return result["message"], 200
