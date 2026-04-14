@@ -711,18 +711,27 @@ def home():
     )
 
 
-@app.route("/run", methods=["POST"])
+@app.route("/run", methods=["POST", "GET"])
 def run_now():
     try:
         result = run_clipbook()
-        return redirect(url_for("home", message=result["message"], ok="1"))
+
+        # If triggered by browser (button)
+        if request.method == "POST":
+            return redirect(url_for("home", message=result["message"], ok="1"))
+
+        # If triggered by cron job (GET)
+        return result["message"], 200
+
     except Exception as e:
         error_message = f"Run failed: {e}"
+
         save_run_status({
             "last_run": get_now_pt_string(),
             "last_result": error_message,
         })
-        return redirect(url_for("home", message=error_message, ok="0"))
+
+        return error_message, 500
 
 
 if __name__ == "__main__":
