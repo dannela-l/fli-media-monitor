@@ -14,6 +14,7 @@ from slack_sdk import WebClient
 
 load_dotenv()
 
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_NAME = os.getenv("SLACK_CHANNEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -25,8 +26,10 @@ LOCAL_TIMEZONE = "America/Los_Angeles"
 STATE_FILE = "seen_articles.json"
 STATUS_FILE = "run_status.json"
 
-DEFAULT_MAX_AGE = 6
-FRESHNESS_OPTIONS = [1, 3, 6, 12, 24]
+DEFAULT_MAX_AGE = 48
+FRESHNESS_OPTIONS = [1, 3, 6, 12, 24, 48]
+USE_NEWSAPI = True
+MAX_AI_ARTICLES = 4
 
 app = Flask(__name__)
 
@@ -93,6 +96,10 @@ RELEVANCE_TERMS = {
     "federal regulation",
     "labor replacement",
     "automation",
+    "safety",
+    "governance",
+    "policy",
+    "regulation",
 }
 
 STRONG_AI_TERMS = {
@@ -106,9 +113,13 @@ STRONG_AI_TERMS = {
     "openai",
     "anthropic",
     "google deepmind",
-    "frontier ai",
+    "google",
+    "meta ai",
+    "chatgpt",
     "agi",
     "asi",
+    "machine learning",
+    "automation",
 }
 
 RSS_FEEDS = {
@@ -172,6 +183,13 @@ PAGE_TEMPLATE = """
       font-size: 15px;
       background: white;
     }
+    .check {
+      margin-top: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+    }
     .btn {
       display: inline-block;
       background: #0f172a;
@@ -217,17 +235,17 @@ PAGE_TEMPLATE = """
 
     <div class="status">
       <strong>Client:</strong> Future of Life Institute<br>
-      <strong>Topics:</strong> AI safety, AGI/ASI risk, regulation, governance, labor displacement, autonomous weapons<br>
       <strong>Slack destination:</strong> {{ channel }}<br>
       <strong>Today:</strong> {{ today }}<br>
       <strong>Freshness window:</strong> last {{ selected_hours }} hour{{ 's' if selected_hours > 1 else '' }}<br>
+      <strong>Mode:</strong> {{ "Test mode (dedupe bypassed)" if test_mode else "Normal mode" }}<br>
+      <strong>Sources:</strong> RSS{% if use_newsapi %} + NewsAPI{% endif %}<br>
       <strong>Last run:</strong> {{ last_run }}<br>
       <strong>Last result:</strong> {{ last_result }}
     </div>
 
     <form method="post" action="/run">
       <label for="hours">Freshness window</label><br><br>
-
       <select name="hours" id="hours">
         {% for h in options %}
           <option value="{{ h }}" {% if h == selected_hours %}selected{% endif %}>
@@ -236,7 +254,12 @@ PAGE_TEMPLATE = """
         {% endfor %}
       </select>
 
-      <br><br>
+      <div class="check">
+        <input type="checkbox" id="test_mode" name="test_mode" value="1" {% if test_mode %}checked{% endif %}>
+        <label for="test_mode">Test mode: ignore same-day duplicate filter</label>
+      </div>
+
+      <br>
       <button class="btn" type="submit">Run clips now</button>
     </form>
 
@@ -245,7 +268,7 @@ PAGE_TEMPLATE = """
     {% endif %}
 
     <div class="note">
-      This page triggers the clip workflow and posts the output into Slack. Same-day duplicate clips are automatically skipped.
+      This page triggers the clip workflow and posts the output into Slack. In normal mode, same-day duplicate clips are skipped. In test mode, clips may be reposted for preview purposes.
     </div>
   </div>
 </body>
@@ -296,12 +319,10 @@ def get_now_pt_string():
 def parse_article_datetime(date_string):
     if not date_string:
         return None
-
     try:
         return datetime.fromisoformat(date_string.replace("Z", "+00:00"))
     except Exception:
         pass
-
     try:
         dt = parsedate_to_datetime(date_string)
         if dt.tzinfo is None:
@@ -315,7 +336,6 @@ def is_fresh_enough(date_string, hours):
     article_dt = parse_article_datetime(date_string)
     if not article_dt:
         return False
-
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=hours)
     return article_dt >= cutoff
@@ -325,7 +345,6 @@ def clean_date(date_string):
     dt = parse_article_datetime(date_string)
     if not dt:
         return date_string
-
     try:
         local_dt = dt.astimezone(ZoneInfo(LOCAL_TIMEZONE))
         return local_dt.strftime("%b %d, %Y at %I:%M %p PT")
@@ -344,13 +363,17 @@ def contains_exact_phrase(text, phrase):
     return re.search(pattern, text.lower()) is not None
 
 
-def classify_article(headline, summary):
-    """
-    Strict FLI detection:
-    - exact phrase match for FLI terms and spokesperson names
-    - broader keyword match for relevant coverage
-    """
-    text = f"{headline} {summary}".lower()
+def has_any_relevance_signal(text):
+    lowered = text.lower()
+    if any(term in lowered for term in RELEVANCE_TERMS):
+        return True
+    if any(term in lowered for term in STRONG_AI_TERMS):
+        return True
+    return False
+
+
+def classify_article(headline, summary, content):
+    text = f"{headline} {summary} {content}".lower()
 
     for term in FLI_TERMS:
         if contains_exact_phrase(text, term):
@@ -360,90 +383,44 @@ def classify_article(headline, summary):
         if contains_exact_phrase(text, person):
             return "Future of Life Institute"
 
-    for term in RELEVANCE_TERMS:
-        if term.lower() in text:
-            return "Relevant Coverage"
+    if has_any_relevance_signal(text):
+        return "Relevant Coverage"
 
     return None
-
-
-def has_strong_ai_signal(text):
-    lowered = text.lower()
-    return any(term in lowered for term in STRONG_AI_TERMS)
-
-
-def generate_why_it_matters(category, text):
-    lowered = text.lower()
-
-    if category == "Future of Life Institute":
-        return (
-            "This article directly references FLI or one of its spokespeople, placing the organization "
-            "in the broader conversation around AI safety, governance, and regulation."
-        )
-
-    if "labor" in lowered or "worker" in lowered or "job" in lowered or "automation" in lowered:
-        return (
-            "This story is relevant to FLI’s concerns about AI-driven labor displacement and the lack of "
-            "safeguards around how advanced systems may reshape work."
-        )
-
-    if "autonomous weapons" in lowered or "military" in lowered or "defense" in lowered:
-        return (
-            "This article aligns with one of FLI’s core issue areas: the risks of advanced AI in military "
-            "and autonomous weapons contexts."
-        )
-
-    if "regulation" in lowered or "policy" in lowered or "governance" in lowered:
-        return (
-            "This story is relevant to FLI’s push for stronger AI regulation and governance as advanced "
-            "systems continue to develop faster than public safeguards."
-        )
-
-    if "agi" in lowered or "asi" in lowered or "superintelligence" in lowered:
-        return (
-            "This article touches on one of FLI’s core concerns: the continued acceleration toward AGI or "
-            "more powerful systems despite unresolved safety and oversight risks."
-        )
-
-    return (
-        "This article is relevant to FLI’s broader focus on AI safety, regulation, and the societal risks "
-        "of increasingly powerful AI systems."
-    )
 
 
 def trim_to_n_sentences(text, max_sentences):
     text = text.strip()
     if not text:
         return text
-
     sentences = re.split(r"(?<=[.!?])\s+", text)
     trimmed = " ".join(sentences[:max_sentences]).strip()
-
     if trimmed and trimmed[-1] not in ".!?":
         trimmed += "."
-
     return trimmed
 
 
 def enhance_article_with_ai(headline, summary, category):
+    base_summary = trim_to_n_sentences(summary or "No summary available.", 3)
+
     if not ANTHROPIC_API_KEY:
-        return trim_to_n_sentences(summary, 3), None
+        return base_summary
 
     try:
         prompt = f"""
 You are a strategic communications analyst preparing a concise daily media clip.
 
 Your job:
-1. Write a SHORT summary (MAX 3 sentences)
-2. Write a sharp "Why it matters" (MAX 2 sentences)
+Write a strong, clean summary of this article in 2 to 3 sentences.
 
 CRITICAL RULES:
 - Do NOT paste or rewrite the full article
 - Do NOT include long paragraphs
-- Be concise, tight, and skimmable
+- Be concise, sharp, and skimmable
 - Focus only on the most important takeaway
 - Avoid repeating the headline
 - No filler language
+- Do NOT include a separate "why it matters" section
 
 FLI context:
 - AI safety
@@ -457,80 +434,86 @@ Headline: {headline}
 Summary: {summary}
 Category: {category}
 
-Return EXACTLY in this format:
-
-SUMMARY:
-[2–3 sentences MAX]
-
-WHY:
-[1–2 sentences MAX]
+Return ONLY the summary text.
 """
 
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=250,
+            max_tokens=180,
             messages=[{"role": "user", "content": prompt}],
         )
 
         if not response.content:
-            return trim_to_n_sentences(summary, 3), None
+            return base_summary
 
         text = response.content[0].text.strip()
-
-        if "WHY:" in text and "SUMMARY:" in text:
-            summary_part, why_part = text.split("WHY:", 1)
-            summary_clean = summary_part.replace("SUMMARY:", "").strip()
-            why_clean = why_part.strip()
-
-            summary_clean = trim_to_n_sentences(summary_clean, 3)
-            why_clean = trim_to_n_sentences(why_clean, 2)
-
-            if summary_clean:
-                return summary_clean, why_clean or None
-
-        return trim_to_n_sentences(summary, 3), None
+        return trim_to_n_sentences(text, 3)
 
     except Exception as e:
         print(f"AI error for article '{headline}': {e}")
-        return trim_to_n_sentences(summary, 3), None
+        return base_summary
 
 
-def format_article(publication, headline, link, date_string, summary, why):
+def format_article(publication, headline, link, date_string, summary):
     pretty_date = clean_date(date_string)
-
     return (
         f"*{publication}* | <{link}|{headline}>\n"
         f"🕒 {pretty_date}\n\n"
-        f"• *Summary:* {summary}\n\n"
-        f"• *Why it matters:* {why}"
+        f"• *Summary:* {summary}"
     )
 
 
 def fetch_rss_articles():
     rss_articles = []
-
     for source_name, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-
-            for entry in feed.entries[:15]:
-                title = entry.get("title", "")
-                link = entry.get("link", "")
-                summary = entry.get("summary", "") or entry.get("description", "")
-                published = entry.get("published", "") or entry.get("updated", "") or ""
-
+            for entry in feed.entries[:20]:
                 rss_articles.append({
                     "source": {"name": source_name},
-                    "title": title,
-                    "description": summary,
-                    "url": link,
-                    "publishedAt": published,
-                    "content": summary,
+                    "title": entry.get("title", "") or "",
+                    "description": entry.get("summary", "") or entry.get("description", "") or "",
+                    "url": entry.get("link", "") or "",
+                    "publishedAt": entry.get("published", "") or entry.get("updated", "") or "",
+                    "content": entry.get("summary", "") or entry.get("description", "") or "",
                 })
         except Exception as e:
             print(f"RSS error for {source_name}: {e}")
-
     return rss_articles
+
+
+def fetch_newsapi_articles():
+    if not USE_NEWSAPI or not NEWS_API_KEY:
+        return []
+
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": '("AI" OR "artificial intelligence" OR "AGI" OR "ASI" OR "AI safety" OR "AI policy" OR "AI regulation" OR "automation" OR "Max Tegmark" OR "Future of Life Institute")',
+        "domains": "reuters.com,politico.com,nytimes.com,washingtonpost.com,bloomberg.com,ft.com,wired.com,technologyreview.com,axios.com,semafor.com,theatlantic.com,cnn.com,cnbc.com,bbc.com",
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 30,
+        "apiKey": NEWS_API_KEY,
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        articles = []
+        for article in data.get("articles", []):
+            articles.append({
+                "source": article.get("source", {}),
+                "title": article.get("title", "") or "",
+                "description": article.get("description", "") or "",
+                "url": article.get("url", "") or "",
+                "publishedAt": article.get("publishedAt", "") or "",
+                "content": article.get("content", "") or "",
+            })
+        return articles
+    except Exception as e:
+        print(f"NewsAPI error: {e}")
+        return []
 
 
 def build_narrative_summary(formatted_fli, article_texts):
@@ -538,38 +521,21 @@ def build_narrative_summary(formatted_fli, article_texts):
     lines = []
 
     if "regulation" in text_blob or "policy" in text_blob or "governance" in text_blob:
-        lines.append(
-            "• Coverage is centering on AI regulation, governance, and whether public safeguards are keeping pace."
-        )
-
+        lines.append("• Coverage is centering on AI regulation, governance, and whether public safeguards are keeping pace.")
     if "labor" in text_blob or "worker" in text_blob or "jobs" in text_blob or "automation" in text_blob:
-        lines.append(
-            "• Labor displacement and the impact of AI on workers continue to surface as a meaningful media theme."
-        )
-
+        lines.append("• Labor displacement and the impact of AI on workers continue to surface as a meaningful media theme.")
     if "autonomous weapons" in text_blob or "military" in text_blob or "defense" in text_blob:
-        lines.append(
-            "• National security and autonomous weapons risks remain part of the broader AI conversation."
-        )
-
+        lines.append("• National security and autonomous weapons risks remain part of the broader AI conversation.")
     if "agi" in text_blob or "asi" in text_blob or "superintelligence" in text_blob:
-        lines.append(
-            "• Some coverage continues to reflect concern about increasingly powerful AI systems and the risks of accelerating capability development."
-        )
+        lines.append("• Some coverage continues to reflect concern about increasingly powerful AI systems and the risks of accelerating capability development.")
 
     if formatted_fli:
-        lines.append(
-            "• At least one story directly referenced FLI or one of its spokespeople, giving the organization a direct foothold in today’s coverage."
-        )
+        lines.append("• At least one story directly referenced FLI or one of its spokespeople, giving the organization a direct foothold in today’s coverage.")
     else:
-        lines.append(
-            "• No direct FLI or spokesperson mentions appeared in this batch, but several stories still aligned with FLI’s core issue areas."
-        )
+        lines.append("• No direct FLI or spokesperson mentions appeared in this batch, but several stories still aligned with FLI’s core issue areas.")
 
     if not lines:
-        lines.append(
-            "• Today’s coverage broadly aligns with FLI’s focus on AI safety, oversight, and the societal consequences of advanced AI systems."
-        )
+        lines.append("• Today’s coverage broadly aligns with FLI’s focus on AI safety, oversight, and the societal consequences of advanced AI systems.")
 
     return "🔑 *KEY NARRATIVES TODAY*\n\n" + "\n".join(lines[:4])
 
@@ -580,23 +546,25 @@ def build_section_message(header, articles, empty_text):
     return f"{header}\n\n" + "\n\n──────────\n\n".join(articles)
 
 
-def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant):
+def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant, test_mode=False):
+    title = "FLI Daily Clipbook (Test Mode)" if test_mode else "FLI Daily Clipbook"
+
+    test_note = ""
+    if test_mode:
+        test_note = "_Test mode is ON — same-day dedupe was bypassed for this run._\n\n"
+
     main_text = (
         "📰 *FLI DAILY CLIPBOOK*\n"
         "_What’s driving coverage today:_\n\n"
         f"{narrative_summary}\n\n"
+        f"{test_note}"
         "_See thread for today’s clips._"
     )
 
     parent = client.chat_postMessage(
         channel=SLACK_CHANNEL_NAME,
-        text="FLI Daily Clipbook",
-        blocks=[
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": main_text[:2900]},
-            }
-        ],
+        text=title,
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": main_text[:2900]}}],
     )
 
     thread_ts = parent["ts"]
@@ -617,28 +585,18 @@ def post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant)
         channel=SLACK_CHANNEL_NAME,
         thread_ts=thread_ts,
         text="Future of Life Institute clips",
-        blocks=[
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": fli_message[:2900]},
-            }
-        ],
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": fli_message[:2900]}}],
     )
 
     client.chat_postMessage(
         channel=SLACK_CHANNEL_NAME,
         thread_ts=thread_ts,
         text="Relevant Coverage clips",
-        blocks=[
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": relevant_message[:2900]},
-            }
-        ],
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": relevant_message[:2900]}}],
     )
 
 
-def run_clipbook(max_hours):
+def run_clipbook(max_hours, test_mode=False):
     seen_data = load_seen_articles()
     today_key = get_today_key()
 
@@ -647,12 +605,15 @@ def run_clipbook(max_hours):
 
     seen_today = set(seen_data[today_key])
 
-    articles = fetch_rss_articles()
+    rss_articles = fetch_rss_articles()
+    newsapi_articles = fetch_newsapi_articles()
+    articles = rss_articles + newsapi_articles
 
     formatted_fli = []
     formatted_relevant = []
     seen_urls = set()
     article_texts = []
+    ai_count = 0
 
     for article in articles:
         publication = article.get("source", {}).get("name", "")
@@ -660,9 +621,10 @@ def run_clipbook(max_hours):
             continue
 
         headline = article.get("title", "") or ""
-        raw_summary = article.get("description") or "No summary available."
+        raw_summary = article.get("description", "") or "No summary available."
         link = article.get("url", "") or ""
         date_string = article.get("publishedAt", "") or ""
+        content = article.get("content", "") or ""
 
         if not is_fresh_enough(date_string, max_hours):
             continue
@@ -671,32 +633,31 @@ def run_clipbook(max_hours):
         if not clean_link:
             continue
 
-        if clean_link in seen_urls or clean_link in seen_today:
+        if clean_link in seen_urls:
+            continue
+
+        if not test_mode and clean_link in seen_today:
             continue
 
         seen_urls.add(clean_link)
 
-        combined_text = " ".join([
-            headline,
-            raw_summary,
-            article.get("content", "") or "",
-        ])
-
-        category = classify_article(headline, raw_summary)
+        category = classify_article(headline, raw_summary, content)
         if not category:
             continue
 
-        if category == "Relevant Coverage" and not has_strong_ai_signal(combined_text):
-            continue
+        combined_text = " ".join([headline, raw_summary, content])
 
-        summary, ai_why = enhance_article_with_ai(
-            headline=headline,
-            summary=raw_summary,
-            category=category,
-        )
+        if ai_count < MAX_AI_ARTICLES:
+            summary = enhance_article_with_ai(
+                headline=headline,
+                summary=raw_summary,
+                category=category,
+            )
+            ai_count += 1
+        else:
+            summary = trim_to_n_sentences(raw_summary, 3)
 
         article_texts.append(combined_text)
-        why = ai_why if ai_why else generate_why_it_matters(category, combined_text)
 
         formatted = format_article(
             publication=publication,
@@ -704,7 +665,6 @@ def run_clipbook(max_hours):
             link=link,
             date_string=date_string,
             summary=summary,
-            why=why,
         )
 
         if category == "Future of Life Institute":
@@ -712,15 +672,20 @@ def run_clipbook(max_hours):
         else:
             formatted_relevant.append(formatted)
 
-        seen_today.add(clean_link)
+        if not test_mode:
+            seen_today.add(clean_link)
 
-    formatted_fli = formatted_fli[:4]
-    formatted_relevant = formatted_relevant[:4]
+    formatted_fli = formatted_fli[:3]
+    formatted_relevant = formatted_relevant[:3]
 
     if not formatted_fli and not formatted_relevant:
         result = {
             "ok": True,
-            "message": f"No new matching clips found in the last {max_hours} hours.",
+            "message": (
+                f"No matching clips found in the last {max_hours} hours."
+                if not test_mode
+                else f"No matching clips found in the last {max_hours} hours, even in test mode."
+            ),
         }
         save_run_status({
             "last_run": get_now_pt_string(),
@@ -729,18 +694,20 @@ def run_clipbook(max_hours):
         return result
 
     narrative_summary = build_narrative_summary(formatted_fli, article_texts)
-    post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant)
+    post_threaded_clipbook(narrative_summary, formatted_fli, formatted_relevant, test_mode=test_mode)
 
-    seen_data[today_key] = list(seen_today)
-    save_seen_articles(seen_data)
+    if not test_mode:
+        seen_data[today_key] = list(seen_today)
+        save_seen_articles(seen_data)
 
     total = len(formatted_fli) + len(formatted_relevant)
     result = {
         "ok": True,
         "message": (
-            f"Posted {total} new clips to Slack "
+            f"Posted {total} clip(s) to Slack "
             f"({len(formatted_fli)} FLI / {len(formatted_relevant)} relevant coverage) "
-            f"— last {max_hours}h window."
+            f"— last {max_hours}h window"
+            f"{' [TEST MODE]' if test_mode else ''}."
         ),
     }
 
@@ -756,6 +723,7 @@ def run_clipbook(max_hours):
 def home():
     status = load_run_status()
     selected_hours = int(request.args.get("hours", DEFAULT_MAX_AGE))
+    test_mode = request.args.get("test_mode", "0") == "1"
 
     return render_template_string(
         PAGE_TEMPLATE,
@@ -767,6 +735,8 @@ def home():
         ok=request.args.get("ok") == "1",
         options=FRESHNESS_OPTIONS,
         selected_hours=selected_hours,
+        test_mode=test_mode,
+        use_newsapi=USE_NEWSAPI,
     )
 
 
@@ -775,10 +745,12 @@ def run_now():
     try:
         if request.method == "POST":
             hours = int(request.form.get("hours", DEFAULT_MAX_AGE))
+            test_mode = request.form.get("test_mode") == "1"
         else:
             hours = int(request.args.get("hours", DEFAULT_MAX_AGE))
+            test_mode = request.args.get("test_mode", "0") == "1"
 
-        result = run_clipbook(hours)
+        result = run_clipbook(hours, test_mode=test_mode)
 
         if request.method == "POST":
             return redirect(url_for(
@@ -786,6 +758,7 @@ def run_now():
                 message=result["message"],
                 ok="1",
                 hours=hours,
+                test_mode="1" if test_mode else "0",
             ))
 
         return result["message"], 200
